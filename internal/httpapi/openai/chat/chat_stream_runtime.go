@@ -46,6 +46,8 @@ type chatStreamRuntime struct {
 	finalErrorStatus  int
 	finalErrorMessage string
 	finalErrorCode    string
+
+	shouldRetry bool
 }
 
 func newChatStreamRuntime(
@@ -203,6 +205,11 @@ func (s *chatStreamRuntime) finalize(finishReason string) {
 		finishReason = "tool_calls"
 	}
 	if len(detected.Calls) == 0 && !s.toolCallsEmitted && strings.TrimSpace(finalText) == "" {
+		if finalThinking != "" {
+			// Upstream returned reasoning without visible output — retryable.
+			s.shouldRetry = true
+			return
+		}
 		status, message, code := upstreamEmptyOutputDetail(finishReason == "content_filter", finalText, finalThinking)
 		s.sendFailedChunk(status, message, code)
 		return

@@ -154,6 +154,14 @@ async function handleVercelStream(req, res, rawBody, payload) {
         return;
       }
       const detected = parseStandaloneToolCalls(outputText, toolNames);
+      // When visible text is empty, also check thinking content for tool calls
+      // to avoid false "empty output" errors when the model puts tool calls in reasoning.
+      if (detected.length === 0 && outputText.trim() === '' && thinkingText !== '') {
+        const detectedInThinking = parseStandaloneToolCalls(thinkingText, toolNames);
+        if (detectedInThinking.length > 0) {
+          detected.push(...detectedInThinking);
+        }
+      }
       if (detected.length > 0 && !toolCallsDoneEmitted) {
         toolCallsEmitted = true;
         toolCallsDoneEmitted = true;
@@ -339,13 +347,13 @@ function upstreamEmptyOutputDetail(contentFilter, _text, thinking) {
   if (thinking !== '') {
     return {
       status: 429,
-      message: 'Upstream account hit a rate limit and returned reasoning without visible output.',
+      message: 'Upstream returned reasoning without visible output.',
       code: 'upstream_empty_output',
     };
   }
   return {
     status: 429,
-    message: 'Upstream account hit a rate limit and returned empty output.',
+    message: 'Upstream returned empty output.',
     code: 'upstream_empty_output',
   };
 }

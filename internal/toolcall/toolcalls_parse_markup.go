@@ -20,6 +20,21 @@ func parseXMLToolCalls(text string) []ParsedToolCall {
 		}
 	}
 	if len(wrappers) == 0 {
+		// Fallback: try to parse <invoke> blocks directly when <tool_calls> is missing
+		invokeBlocks := findXMLElementBlocks(text, "invoke")
+		if len(invokeBlocks) > 0 {
+			out := make([]ParsedToolCall, 0, len(invokeBlocks))
+			for _, block := range invokeBlocks {
+				call, ok := parseSingleXMLToolCall(block)
+				if !ok {
+					continue
+				}
+				out = append(out, call)
+			}
+			if len(out) > 0 {
+				return out
+			}
+		}
 		return nil
 	}
 	out := make([]ParsedToolCall, 0, len(wrappers))

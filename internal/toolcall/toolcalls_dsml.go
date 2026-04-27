@@ -8,7 +8,9 @@ func normalizeDSMLToolCallMarkup(text string) (string, bool) {
 	}
 	hasDSML, hasCanonical := toolMarkupStylesOutsideIgnored(text)
 	if hasDSML && hasCanonical {
-		return text, false
+		// Mixed DSML + canonical markup — normalize DSML parts to canonical,
+		// then let the XML parser handle the combined result.
+		return replaceDSMLToolMarkupOutsideIgnored(text), true
 	}
 	if !hasDSML {
 		return text, true

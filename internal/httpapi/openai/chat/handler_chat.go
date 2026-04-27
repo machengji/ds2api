@@ -105,10 +105,10 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if stdReq.Stream {
-		h.handleStream(w, r, resp, sessionID, stdReq.ResponseModel, stdReq.FinalPrompt, stdReq.Thinking, stdReq.Search, stdReq.ToolNames, historySession)
+		h.handleStream(w, r, resp, sessionID, stdReq.ResponseModel, stdReq.FinalPrompt, stdReq.Thinking, stdReq.Search, stdReq.ToolNames, historySession, a, payload)
 		return
 	}
-	h.handleNonStream(w, resp, sessionID, stdReq.ResponseModel, stdReq.FinalPrompt, stdReq.Thinking, stdReq.Search, stdReq.ToolNames, historySession)
+	h.handleNonStream(w, resp, sessionID, stdReq.ResponseModel, stdReq.FinalPrompt, stdReq.Thinking, stdReq.Search, stdReq.ToolNames, historySession, a, payload)
 }
 
 func (h *Handler) autoDeleteRemoteSession(ctx context.Context, a *auth.RequestAuth, sessionID string) {
@@ -144,130 +144,185 @@ func (h *Handler) autoDeleteRemoteSession(ctx context.Context, a *auth.RequestAu
 	}
 }
 
-func (h *Handler) handleNonStream(w http.ResponseWriter, resp *http.Response, completionID, model, finalPrompt string, thinkingEnabled, searchEnabled bool, toolNames []string, historySession *chatHistorySession) {
-	if resp.StatusCode != http.StatusOK {
-		defer func() { _ = resp.Body.Close() }()
-		body, _ := io.ReadAll(resp.Body)
-		if historySession != nil {
-			historySession.error(resp.StatusCode, string(body), "error", "", "")
-		}
-		writeOpenAIError(w, resp.StatusCode, string(body))
-		return
-	}
-	result := sse.CollectStream(resp, thinkingEnabled, true)
+func (h *Handler) handleNonStream(w http.ResponseWriter, resp *http.Response, completionID, model, finalPrompt string, thinkingEnabled, searchEnabled bool, toolNames []string, historySession *chatHistorySession, a *auth.RequestAuth, payload map[string]any) {
+	const maxRetries = 2
 
-	stripReferenceMarkers := h.compatStripReferenceMarkers()
-	finalThinking := cleanVisibleOutput(result.Thinking, stripReferenceMarkers)
-	finalToolDetectionThinking := cleanVisibleOutput(result.ToolDetectionThinking, stripReferenceMarkers)
-	finalText := cleanVisibleOutput(result.Text, stripReferenceMarkers)
-	if searchEnabled {
-		finalText = replaceCitationMarkersWithLinks(finalText, result.CitationLinks)
-	}
-	detected := detectAssistantToolCalls(finalText, finalThinking, finalToolDetectionThinking, toolNames)
-	if shouldWriteUpstreamEmptyOutputError(finalText) && len(detected.Calls) == 0 {
-		status, message, code := upstreamEmptyOutputDetail(result.ContentFilter, finalText, finalThinking)
-		if historySession != nil {
-			historySession.error(status, message, code, finalThinking, finalText)
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			resp.Body.Close()
+			pow, err := h.DS.GetPow(context.Background(), a, 3)
+			if err != nil {
+				if historySession != nil {
+					historySession.error(http.StatusUnauthorized, "Failed to get PoW on retry.", "error", "", "")
+				}
+				writeOpenAIError(w, http.StatusUnauthorized, "Failed to get PoW on retry.")
+				return
+			}
+			resp, err = h.DS.CallCompletion(context.Background(), a, payload, pow, 3)
+			if err != nil {
+				if historySession != nil {
+					historySession.error(http.StatusInternalServerError, "Failed to get completion on retry.", "error", "", "")
+				}
+				writeOpenAIError(w, http.StatusInternalServerError, "Failed to get completion on retry.")
+				return
+			}
 		}
-		writeUpstreamEmptyOutputError(w, finalText, finalThinking, result.ContentFilter)
+		if resp.StatusCode != http.StatusOK {
+			defer func() { _ = resp.Body.Close() }()
+			body, _ := io.ReadAll(resp.Body)
+			if historySession != nil {
+				historySession.error(resp.StatusCode, string(body), "error", "", "")
+			}
+			writeOpenAIError(w, resp.StatusCode, string(body))
+			return
+		}
+		result := sse.CollectStream(resp, thinkingEnabled, true)
+
+		stripReferenceMarkers := h.compatStripReferenceMarkers()
+		finalThinking := cleanVisibleOutput(result.Thinking, stripReferenceMarkers)
+		finalToolDetectionThinking := cleanVisibleOutput(result.ToolDetectionThinking, stripReferenceMarkers)
+		finalText := cleanVisibleOutput(result.Text, stripReferenceMarkers)
+		if searchEnabled {
+			finalText = replaceCitationMarkersWithLinks(finalText, result.CitationLinks)
+		}
+		detected := detectAssistantToolCalls(finalText, finalThinking, finalToolDetectionThinking, toolNames)
+		if shouldWriteUpstreamEmptyOutputError(finalText) && len(detected.Calls) == 0 {
+			if finalThinking != "" && attempt+1 < maxRetries {
+				config.Logger.Warn("[nonstream] upstream returned reasoning without visible output, retrying", "attempt", attempt)
+				continue
+			}
+			status, message, code := upstreamEmptyOutputDetail(result.ContentFilter, finalText, finalThinking)
+			if historySession != nil {
+				historySession.error(status, message, code, finalThinking, finalText)
+			}
+			writeUpstreamEmptyOutputError(w, finalText, finalThinking, result.ContentFilter)
+			return
+		}
+		respBody := openaifmt.BuildChatCompletionWithToolCalls(completionID, model, finalPrompt, finalThinking, finalText, detected.Calls)
+		finishReason := "stop"
+		if choices, ok := respBody["choices"].([]map[string]any); ok && len(choices) > 0 {
+			if fr, _ := choices[0]["finish_reason"].(string); strings.TrimSpace(fr) != "" {
+				finishReason = fr
+			}
+		}
+		if historySession != nil {
+			historySession.success(http.StatusOK, finalThinking, finalText, finishReason, openaifmt.BuildChatUsage(finalPrompt, finalThinking, finalText))
+		}
+		writeJSON(w, http.StatusOK, respBody)
 		return
 	}
-	respBody := openaifmt.BuildChatCompletionWithToolCalls(completionID, model, finalPrompt, finalThinking, finalText, detected.Calls)
-	finishReason := "stop"
-	if choices, ok := respBody["choices"].([]map[string]any); ok && len(choices) > 0 {
-		if fr, _ := choices[0]["finish_reason"].(string); strings.TrimSpace(fr) != "" {
-			finishReason = fr
-		}
-	}
-	if historySession != nil {
-		historySession.success(http.StatusOK, finalThinking, finalText, finishReason, openaifmt.BuildChatUsage(finalPrompt, finalThinking, finalText))
-	}
-	writeJSON(w, http.StatusOK, respBody)
 }
 
-func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, resp *http.Response, completionID, model, finalPrompt string, thinkingEnabled, searchEnabled bool, toolNames []string, historySession *chatHistorySession) {
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		if historySession != nil {
-			historySession.error(resp.StatusCode, string(body), "error", "", "")
+func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, resp *http.Response, completionID, model, finalPrompt string, thinkingEnabled, searchEnabled bool, toolNames []string, historySession *chatHistorySession, a *auth.RequestAuth, payload map[string]any) {
+	const maxRetries = 2
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			resp.Body.Close()
+			pow, powErr := h.DS.GetPow(r.Context(), a, 3)
+			if powErr != nil {
+				writeOpenAIError(w, http.StatusUnauthorized, "Failed to get PoW on retry.")
+				return
+			}
+			var callErr error
+			resp, callErr = h.DS.CallCompletion(r.Context(), a, payload, pow, 3)
+			if callErr != nil {
+				writeOpenAIError(w, http.StatusInternalServerError, "Failed to get completion on retry.")
+				return
+			}
 		}
-		writeOpenAIError(w, resp.StatusCode, string(body))
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache, no-transform")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	rc := http.NewResponseController(w)
-	_, canFlush := w.(http.Flusher)
-	if !canFlush {
-		config.Logger.Warn("[stream] response writer does not support flush; streaming may be buffered")
-	}
 
-	created := time.Now().Unix()
-	bufferToolContent := len(toolNames) > 0
-	emitEarlyToolDeltas := h.toolcallFeatureMatchEnabled() && h.toolcallEarlyEmitHighConfidence()
-	stripReferenceMarkers := h.compatStripReferenceMarkers()
-	initialType := "text"
-	if thinkingEnabled {
-		initialType = "thinking"
-	}
-
-	streamRuntime := newChatStreamRuntime(
-		w,
-		rc,
-		canFlush,
-		completionID,
-		created,
-		model,
-		finalPrompt,
-		thinkingEnabled,
-		searchEnabled,
-		stripReferenceMarkers,
-		toolNames,
-		bufferToolContent,
-		emitEarlyToolDeltas,
-	)
-
-	streamengine.ConsumeSSE(streamengine.ConsumeConfig{
-		Context:             r.Context(),
-		Body:                resp.Body,
-		ThinkingEnabled:     thinkingEnabled,
-		InitialType:         initialType,
-		KeepAliveInterval:   time.Duration(dsprotocol.KeepAliveTimeout) * time.Second,
-		IdleTimeout:         time.Duration(dsprotocol.StreamIdleTimeout) * time.Second,
-		MaxKeepAliveNoInput: dsprotocol.MaxKeepaliveCount,
-	}, streamengine.ConsumeHooks{
-		OnKeepAlive: func() {
-			streamRuntime.sendKeepAlive()
-		},
-		OnParsed: func(parsed sse.LineResult) streamengine.ParsedDecision {
-			decision := streamRuntime.onParsed(parsed)
+		if resp.StatusCode != http.StatusOK {
+			defer func() { _ = resp.Body.Close() }()
+			body, _ := io.ReadAll(resp.Body)
 			if historySession != nil {
-				historySession.progress(streamRuntime.thinking.String(), streamRuntime.text.String())
+				historySession.error(resp.StatusCode, string(body), "error", "", "")
 			}
-			return decision
-		},
-		OnFinalize: func(reason streamengine.StopReason, _ error) {
-			if string(reason) == "content_filter" {
-				streamRuntime.finalize("content_filter")
-			} else {
-				streamRuntime.finalize("stop")
-			}
-			if historySession == nil {
-				return
-			}
-			if streamRuntime.finalErrorMessage != "" {
-				historySession.error(streamRuntime.finalErrorStatus, streamRuntime.finalErrorMessage, streamRuntime.finalErrorCode, streamRuntime.thinking.String(), streamRuntime.text.String())
-				return
-			}
-			historySession.success(http.StatusOK, streamRuntime.finalThinking, streamRuntime.finalText, streamRuntime.finalFinishReason, streamRuntime.finalUsage)
-		},
-		OnContextDone: func() {
-			if historySession != nil {
-				historySession.stopped(streamRuntime.thinking.String(), streamRuntime.text.String(), string(streamengine.StopReasonContextCancelled))
-			}
-		},
-	})
+			writeOpenAIError(w, resp.StatusCode, string(body))
+			return
+		}
+		if attempt == 0 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache, no-transform")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("X-Accel-Buffering", "no")
+		}
+		rc := http.NewResponseController(w)
+		_, canFlush := w.(http.Flusher)
+		if !canFlush {
+			config.Logger.Warn("[stream] response writer does not support flush; streaming may be buffered")
+		}
+
+		created := time.Now().Unix()
+		bufferToolContent := len(toolNames) > 0
+		emitEarlyToolDeltas := h.toolcallFeatureMatchEnabled() && h.toolcallEarlyEmitHighConfidence()
+		stripReferenceMarkers := h.compatStripReferenceMarkers()
+		initialType := "text"
+		if thinkingEnabled {
+			initialType = "thinking"
+		}
+
+		streamRuntime := newChatStreamRuntime(
+			w,
+			rc,
+			canFlush,
+			completionID,
+			created,
+			model,
+			finalPrompt,
+			thinkingEnabled,
+			searchEnabled,
+			stripReferenceMarkers,
+			toolNames,
+			bufferToolContent,
+			emitEarlyToolDeltas,
+		)
+
+		streamengine.ConsumeSSE(streamengine.ConsumeConfig{
+			Context:             r.Context(),
+			Body:                resp.Body,
+			ThinkingEnabled:     thinkingEnabled,
+			InitialType:         initialType,
+			KeepAliveInterval:   time.Duration(dsprotocol.KeepAliveTimeout) * time.Second,
+			IdleTimeout:         time.Duration(dsprotocol.StreamIdleTimeout) * time.Second,
+			MaxKeepAliveNoInput: dsprotocol.MaxKeepaliveCount,
+		}, streamengine.ConsumeHooks{
+			OnKeepAlive: func() {
+				streamRuntime.sendKeepAlive()
+			},
+			OnParsed: func(parsed sse.LineResult) streamengine.ParsedDecision {
+				decision := streamRuntime.onParsed(parsed)
+				if historySession != nil {
+					historySession.progress(streamRuntime.thinking.String(), streamRuntime.text.String())
+				}
+				return decision
+			},
+			OnFinalize: func(reason streamengine.StopReason, _ error) {
+				if string(reason) == "content_filter" {
+					streamRuntime.finalize("content_filter")
+				} else {
+					streamRuntime.finalize("stop")
+				}
+				if historySession == nil || streamRuntime.shouldRetry {
+					return
+				}
+				if streamRuntime.finalErrorMessage != "" {
+					historySession.error(streamRuntime.finalErrorStatus, streamRuntime.finalErrorMessage, streamRuntime.finalErrorCode, streamRuntime.thinking.String(), streamRuntime.text.String())
+					return
+				}
+				historySession.success(http.StatusOK, streamRuntime.finalThinking, streamRuntime.finalText, streamRuntime.finalFinishReason, streamRuntime.finalUsage)
+			},
+			OnContextDone: func() {
+				if historySession != nil {
+					historySession.stopped(streamRuntime.thinking.String(), streamRuntime.text.String(), string(streamengine.StopReasonContextCancelled))
+				}
+			},
+		})
+
+		if !streamRuntime.shouldRetry {
+			resp.Body.Close()
+			return
+		}
+		config.Logger.Warn("[stream] upstream returned reasoning without visible output, retrying", "attempt", attempt)
+	}
 }
